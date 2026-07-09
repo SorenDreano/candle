@@ -2,17 +2,14 @@ use std::f64;
 
 use candle::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::{
-    embedding, layer_norm, linear, Activation, Embedding, LayerNorm, LayerNormConfig, Linear,
-    Module, VarBuilder,
+    conv3d, embedding, layer_norm, linear, Activation, Conv3d, Conv3dConfig, Embedding, LayerNorm,
+    LayerNormConfig, Linear, Module, VarBuilder,
 };
-
-use crate::models::qwen3_vl::conv3d_temporal_2::{Conv3dConfig, Conv3dNoBias};
 
 use super::config::VisionConfig;
 
 struct PatchEmbed {
-    proj: Conv3dNoBias,
-    bias: Tensor,
+    proj: Conv3d,
     in_channels: usize,
     patch_size: usize,
     temporal_patch_size: usize,
@@ -21,21 +18,18 @@ struct PatchEmbed {
 
 impl PatchEmbed {
     fn new(cfg: &VisionConfig, vb: VarBuilder) -> Result<Self> {
-        let proj_vb = vb.pp("proj");
-        let proj = Conv3dNoBias::new(
+        let proj = conv3d(
             cfg.in_chans,
             cfg.hidden_size,
             [cfg.temporal_patch_size, cfg.patch_size, cfg.patch_size],
             Conv3dConfig {
-                stride: cfg.patch_size,
+                stride: [cfg.temporal_patch_size, cfg.patch_size, cfg.patch_size],
                 ..Default::default()
             },
-            proj_vb.clone(),
+            vb.pp("proj"),
         )?;
-        let bias = proj_vb.get(cfg.hidden_size, "bias")?;
         Ok(Self {
             proj,
-            bias,
             in_channels: cfg.in_chans,
             patch_size: cfg.patch_size,
             temporal_patch_size: cfg.temporal_patch_size,
@@ -52,9 +46,7 @@ impl PatchEmbed {
             self.patch_size,
         ))?;
         let xs = self.proj.forward(&xs)?;
-        let xs = xs.reshape(((), self.hidden_size))?;
-        let bias = self.bias.unsqueeze(0)?;
-        xs.broadcast_add(&bias)
+        xs.reshape(((), self.hidden_size))
     }
 }
 
@@ -581,5 +573,101 @@ impl Qwen3VLVisionModel {
 
         let hidden_states = self.merger.forward(&hidden_states)?;
         Ok((hidden_states, deepstack_features))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle::IndexOp;
+    use std::collections::HashMap;
+
+    /// The implementation `PatchEmbed` used before candle gained a generic
+    /// `Conv3d`: split the temporal dimension (fixed at 2) into two `Conv2d`
+    /// applications and sum the results.
+    /// https://github.com/pytorch/pytorch/issues/139066
+    fn temporal_conv2d_reference(
+        xs: &Tensor,
+        weight: &Tensor,
+        bias: &Tensor,
+        stride: usize,
+    ) -> Result<Tensor> {
+        let cfg = candle_nn::Conv2dConfig {
+            stride,
+            ..Default::default()
+        };
+        let w1 = weight.i((.., .., 0, .., ..))?.contiguous()?;
+        let w2 = weight.i((.., .., 1, .., ..))?.contiguous()?;
+        let conv1 = candle_nn::Conv2d::new(w1, None, cfg);
+        let conv2 = candle_nn::Conv2d::new(w2, None, cfg);
+        let xs1 = xs.i((.., .., 0, .., ..))?;
+        let xs2 = xs.i((.., .., 1, .., ..))?;
+        let ys = (conv1.forward(&xs1)? + conv2.forward(&xs2)?)?;
+        let out_c = ys.dim(1)?;
+        ys.reshape(((), out_c))?.broadcast_add(&bias.unsqueeze(0)?)
+    }
+
+    #[test]
+    fn patch_embed_matches_temporal_conv2d_decomposition() -> Result<()> {
+        let dev = Device::Cpu;
+        let cfg = VisionConfig {
+            depth: 1,
+            hidden_size: 8,
+            out_hidden_size: 8,
+            hidden_act: Activation::Gelu,
+            intermediate_size: 16,
+            num_heads: 2,
+            in_chans: 3,
+            patch_size: 4,
+            spatial_merge_size: 2,
+            temporal_patch_size: 2,
+            num_position_embeddings: 16,
+            deepstack_visual_indexes: vec![],
+        };
+        let weight = Tensor::randn(
+            0f32,
+            1.,
+            (
+                cfg.hidden_size,
+                cfg.in_chans,
+                cfg.temporal_patch_size,
+                cfg.patch_size,
+                cfg.patch_size,
+            ),
+            &dev,
+        )?;
+        let bias = Tensor::randn(0f32, 1., cfg.hidden_size, &dev)?;
+        let vb = VarBuilder::from_tensors(
+            HashMap::from([
+                ("proj.weight".to_string(), weight.clone()),
+                ("proj.bias".to_string(), bias.clone()),
+            ]),
+            DType::F32,
+            &dev,
+        );
+        let patch_embed = PatchEmbed::new(&cfg, vb)?;
+
+        let n_patches = 5;
+        let patch_dim = cfg.in_chans * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
+        let xs = Tensor::randn(0f32, 1., (n_patches, patch_dim), &dev)?;
+
+        let ys = patch_embed.forward(&xs)?;
+        assert_eq!(ys.dims(), [n_patches, cfg.hidden_size]);
+
+        let xs5 = xs.reshape((
+            n_patches,
+            cfg.in_chans,
+            cfg.temporal_patch_size,
+            cfg.patch_size,
+            cfg.patch_size,
+        ))?;
+        let ys_ref = temporal_conv2d_reference(&xs5, &weight, &bias, cfg.patch_size)?;
+
+        let diff = (ys - ys_ref)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(
+            diff < 1e-5,
+            "max abs diff between conv3d and conv2d decomposition: {diff}"
+        );
+        Ok(())
     }
 }

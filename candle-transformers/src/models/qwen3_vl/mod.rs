@@ -6,7 +6,6 @@ use text::Qwen3VLTextModel;
 use vision::Qwen3VLVisionModel;
 
 pub mod config;
-mod conv3d_temporal_2;
 mod text;
 mod vision;
 
